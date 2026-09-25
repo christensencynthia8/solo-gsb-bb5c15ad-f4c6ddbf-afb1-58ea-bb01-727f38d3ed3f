@@ -406,3 +406,57 @@ th.recommended-col,
 td.recommended-col {
   background: #f3eefc;
 }
+
+/* ============ 关阀作业路线 ============ */
+.sub-textarea {
+  min-height: 190px;
+  margin-top: 4px;
+}
+
+.solution-actions {
+  margin: 6px 0 8px;
+}
+
+button.select-solution-btn {
+  border-color: var(--primary);
+  color: var(--primary);
+  font-weight: 600;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+}
+
+button.select-solution-btn.selected {
+  background: var(--primary);
+  color: #fff;
+  cursor: default;
+}
+
+.selected-hint {
+  color: var(--primary-dark);
+}
+
+.op-step {
+  display: inline-block;
+  margin: 4px 0;
+  white-space: nowrap;
+}
+
+.op-no {
+  display: inline-block;
+  min-width: 20px;
+  height: 20px;
+  line-height: 20px;
+  text-align: center;
+  border-radius: 999px;
+  background: var(--primary);
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 700;
+  margin-right: 2px;
+}
+
+tfoot td {
+  border-bottom: none;
+  border-top: 2px solid var(--border);
+  font-size: 0.95rem;
+}

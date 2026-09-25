@@ -1045,5 +1045,274 @@ const beforeReopen = JSON.stringify(reopenNet);
 solver.planReopenSequence(reopenNet, { supplies: ['S'], outlets: ['O'], supplyCaps: { S: 5 }, outletDemands: { O: 5 } });
 check('规划不修改输入网络与登记状态', JSON.stringify(reopenNet) === beforeReopen);
 
+// ============ 关阀作业路线 ============
+console.log('关阀作业路线：');
+
+// 步行网络（与供水管网独立）：
+//         3        4        5
+//   大门 ─── 路口A ─── N1井 ─── N2井
+//    │                 │         │
+//    8                6│        5│
+//    │                 │         │
+//   路口B ──4── N3井 ──── N4井 ───┘
+//   阀门映射 V1=N1井 V2=N2井 V3=N3井 V4=N4井
+const routeNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'O', open: true },
+    { id: 'V2', from: 'S', to: 'O', open: true },
+    { id: 'V3', from: 'S', to: 'O', open: true },
+    { id: 'V4', from: 'S', to: 'O', open: false },
+    { id: 'V5', from: 'S', to: 'O', open: true },
+  ],
+};
+const passage = {
+  waypoints: ['大门', '路口A', '路口B', 'N1井', 'N2井', 'N3井', 'N4井'],
+  passages: [
+    { id: 'W1', from: '大门', to: '路口A', minutes: 3 },
+    { id: 'W2', from: '大门', to: '路口B', minutes: 8 },
+    { id: 'W3', from: '路口A', to: 'N1井', minutes: 4 },
+    { id: 'W4', from: 'N1井', to: 'N2井', minutes: 5 },
+    { id: 'W5', from: 'N2井', to: 'N4井', minutes: 5 },
+    { id: 'W6', from: 'N4井', to: 'N3井', minutes: 5 },
+    { id: 'W7', from: 'N3井', to: '路口B', minutes: 4 },
+    { id: 'W8', from: 'N3井', to: 'N1井', minutes: 6 },
+  ],
+  valveWaypoints: { V1: 'N1井', V2: 'N2井', V3: 'N3井', V4: 'N4井', V5: 'N1井' },
+};
+const planRoute = (closedValves, start, psg = passage, net = routeNet) =>
+  solver.planClosureRoute({ network: net, closedValves, passage: psg, start });
+
+// 必访 V1、V2（d(大门,N1)=7, d(N1,N2)=5, d(N2,大门)=15）→ 24；
+// 反向顺序 V2,V1：12 + 5 + 7 = 24，同分按字典序取 [V1,V2]
+const rt1 = planRoute(['V2', 'V1'], '大门');
+check('返回 ok', rt1.status === 'ok');
+check('必访阀门去重排序后为 2 个', rt1.requiredValveCount === 2);
+check('同耗时按阀门编号字典序取 [V1,V2]', rt1.valveOrder.join(',') === 'V1,V2');
+check('总耗时 24 分钟', rt1.totalMinutes === 24);
+check('段数 = 必访数 + 1 = 3', rt1.segments.length === 3);
+check('段落类型 出发/转场/返程',
+  rt1.segments.map((s) => s.kind).join(',') === 'depart,between,return');
+check('各段操作阀门依次为 V1、V2、null',
+  rt1.segments[0].valve === 'V1' && rt1.segments[1].valve === 'V2' && rt1.segments[2].valve === null);
+check('各段耗时 7、5、12（返程 N2→大门=12）',
+  rt1.segments.map((s) => s.minutes).join(',') === '7,5,12');
+check('各段实际通道路点正确（返程与去程重复经过 N1井、路口A）',
+  rt1.segments[0].path.join('→') === '大门→路口A→N1井' &&
+  rt1.segments[1].path.join('→') === 'N1井→N2井' &&
+  rt1.segments[2].path.join('→') === 'N2井→N1井→路口A→大门');
+check('相邻段衔接点一致（允许重复经过路点）',
+  rt1.segments[0].path.at(-1) === rt1.segments[1].path[0] &&
+  rt1.segments[1].path.at(-1) === rt1.segments[2].path[0]);
+
+console.log('作业路线：同耗时不同顺序由字典序裁决：');
+// 单阀门 V5 与 V1 同点：必访 [V1,V5] 时两点相同，总耗时 = 7+0+7 = 14
+const rt1b = planRoute(['V5', 'V1'], '大门');
+check('同点阀门之间转场耗时 0、实际路径只有一个路点',
+  rt1b.status === 'ok' && rt1b.totalMinutes === 14 &&
+  rt1b.segments[1].minutes === 0 && rt1b.segments[1].path.join(',') === 'N1井');
+check('操作顺序 [V1,V5]（字典序最小）', rt1b.valveOrder.join(',') === 'V1,V5');
+
+console.log('作业路线：并行通道取最短，最短路等耗时按路点序列字典序：');
+const tiePsg = {
+  waypoints: ['大门', 'A井', 'B井', 'M'],
+  passages: [
+    { from: '大门', to: 'A井', minutes: 5 },
+    { from: '大门', to: 'B井', minutes: 5 },
+    { from: 'A井', to: 'M', minutes: 2 },
+    { from: 'B井', to: 'M', minutes: 2 },
+  ],
+  valveWaypoints: { V1: 'M' },
+};
+const rt2 = planRoute(['V1'], '大门', tiePsg);
+check('等耗时最短路取路点序列字典序（大门→A井→M）',
+  rt2.status === 'ok' && rt2.totalMinutes === 14 &&
+  rt2.segments[0].path.join('→') === '大门→A井→M' &&
+  rt2.segments[1].path.join('→') === 'M→A井→大门');
+// 并行通道：大门—A井 两条，取分钟较小者
+const parallelPsg = {
+  waypoints: ['大门', 'A井'],
+  passages: [
+    { from: '大门', to: 'A井', minutes: 9 },
+    { from: 'A井', to: '大门', minutes: 3 },
+  ],
+  valveWaypoints: { V1: 'A井' },
+};
+const rt2b = planRoute(['V1'], '大门', parallelPsg);
+check('同名端点并行通道取最小分钟（3，往返 6）', rt2b.totalMinutes === 6);
+
+console.log('作业路线：子集动态规划选择真正最优访问顺序：');
+// 大门—N1=7, 大门—N3=12；若先远后近：V3(12)+N3→N1(6)+V1(7)=25；
+// 先近后远 V1,V3：7 + 6 + 12 = 25（本例同构对称，同分时取 [V1,V3]）
+const rt3 = planRoute(['V3', 'V1'], '大门');
+check('两阀场景总耗时 25、顺序 [V1,V3]',
+  rt3.status === 'ok' && rt3.totalMinutes === 25 && rt3.valveOrder.join(',') === 'V1,V3');
+// 构造非对称：N3 更近 → 应先访问 N3（V3）
+const asymPsg = {
+  waypoints: ['大门', '近点', '远点', '中点'],
+  passages: [
+    { from: '大门', to: '近点', minutes: 1 },
+    { from: '近点', to: '中点', minutes: 2 },
+    { from: '中点', to: '远点', minutes: 2 },
+  ],
+  valveWaypoints: { V1: '远点', V3: '近点', V4: '中点' },
+};
+// V3=近点(1), V4=中点(3), V1=远点(5)，三点在同一条直线上：
+// 先去最远再原路返回（[V1,V4,V3]）或反向（[V3,V4,V1]）都只需走两遍全程 = 10；
+// 同分按阀门编号序列字典序取 [V1,V4,V3]
+const rt3b = planRoute(['V1', 'V4', 'V3'], '大门', asymPsg);
+check('三阀直线场景总耗时 10、顺序 [V1,V4,V3]（字典序最小）',
+  rt3b.status === 'ok' && rt3b.totalMinutes === 10 && rt3b.valveOrder.join(',') === 'V1,V4,V3');
+
+console.log('作业路线：重复经过路点 / 通道：');
+// 死胡同：V1 在支路尽头，V2 在另一支路尽头，必经大门中转
+const deadPsg = {
+  waypoints: ['大门', 'X', 'Y'],
+  passages: [
+    { from: '大门', to: 'X', minutes: 2 },
+    { from: '大门', to: 'Y', minutes: 3 },
+  ],
+  valveWaypoints: { V1: 'X', V2: 'Y' },
+};
+const rt4 = planRoute(['V2', 'V1'], '大门', deadPsg);
+check('死胡同往返：总耗时 2+2+3+3=10', rt4.status === 'ok' && rt4.totalMinutes === 10);
+check('路线重复经过大门与通道（V1→V2 经大门）',
+  rt4.segments[1].path.join('→') === 'X→大门→Y' && rt4.segments[1].minutes === 5);
+
+console.log('作业路线：映射缺失：');
+const missPsg = { waypoints: passage.waypoints, passages: passage.passages, valveWaypoints: { V1: 'N1井' } };
+const rt5 = planRoute(['V1', 'V2'], '大门', missPsg);
+check('缺少 V2 映射返回 missing-map', rt5.status === 'missing-map' &&
+  rt5.missingValves.join(',') === 'V2' && rt5.reason.includes('V2'));
+const rt5b = planRoute(['V1', 'V3', 'V4'], '大门', missPsg);
+check('多个缺失阀门按编号升序列出', rt5b.status === 'missing-map' &&
+  rt5b.missingValves.join(',') === 'V3,V4');
+// 映射到的阀门不在方案中不报错（多余映射忽略）
+const extraPsg = {
+  waypoints: passage.waypoints,
+  passages: passage.passages,
+  valveWaypoints: { V1: 'N1井', V99: 'N1井' },
+};
+check('多余的阀门映射被忽略', planRoute(['V1'], '大门', extraPsg).status === 'ok');
+
+console.log('作业路线：必访阀门数量上限：');
+const manyRouteNet = {
+  nodes: ['a', 'b'],
+  pipes: [],
+  valvedPipes: Array.from({ length: 9 }, (_, i) => ({ id: `V${i}`, from: 'a', to: 'b', open: true })),
+};
+const manyPsg = {
+  waypoints: ['a'],
+  passages: [],
+  valveWaypoints: Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`V${i}`, 'a'])),
+};
+const rt6 = planRoute(Array.from({ length: 9 }, (_, i) => `V${i}`), 'a', manyPsg, manyRouteNet);
+check('9 个必访阀门被拒绝（too-many）', rt6.status === 'too-many' &&
+  rt6.requiredValveCount === 9 && rt6.reason.includes('9') && rt6.reason.includes('8'));
+const eightPsg = {
+  waypoints: ['a'],
+  passages: [],
+  valveWaypoints: Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`V${i}`, 'a'])),
+};
+const eightNet = {
+  nodes: ['a', 'b'],
+  pipes: [],
+  valvedPipes: Array.from({ length: 8 }, (_, i) => ({ id: `V${i}`, from: 'a', to: 'b', open: true })),
+};
+check('恰好 8 个必访阀门可规划（全部同点，总耗时 0）',
+  planRoute(Array.from({ length: 8 }, (_, i) => `V${i}`), 'a', eightPsg, eightNet).status === 'ok');
+
+console.log('作业路线：无路可达：');
+const islandPsg = {
+  waypoints: ['大门', 'X', '孤岛'],
+  passages: [{ from: '大门', to: 'X', minutes: 2 }],
+  valveWaypoints: { V1: 'X', V2: '孤岛' },
+};
+const rt7 = planRoute(['V1', 'V2'], '大门', islandPsg);
+check('孤岛阀门返回 unreachable', rt7.status === 'unreachable' &&
+  rt7.pairs.some((p) => p.from.includes('大门') && p.to.includes('V2')));
+// 出发点孤岛（全部阀门在另一连通块）
+const islandStartPsg = {
+  waypoints: ['大门', 'X'],
+  passages: [],
+  valveWaypoints: { V1: 'X' },
+};
+const rt7b = planRoute(['V1'], '大门', islandStartPsg);
+check('出发点与阀门不通返回 unreachable', rt7b.status === 'unreachable' && rt7b.pairs.length === 1);
+// 阀门之间不通但都与出发点不通：逐对列出
+const twoIslandPsg = {
+  waypoints: ['大门', 'X', 'Y'],
+  passages: [{ from: '大门', to: 'X', minutes: 1 }],
+  valveWaypoints: { V1: 'X', V2: 'Y' },
+};
+const rt7c = planRoute(['V1', 'V2'], '大门', twoIslandPsg);
+check('不可达对全部列出（出发-V2 与 V1-V2 共 2 对）', rt7c.status === 'unreachable' && rt7c.pairs.length === 2);
+
+console.log('作业路线：无需关阀（空方案）：');
+const rt8 = planRoute([], '大门');
+check('空必访清单返回 ok、总耗时 0', rt8.status === 'ok' &&
+  rt8.requiredValveCount === 0 && rt8.valveOrder.length === 0 &&
+  rt8.segments.length === 0 && rt8.totalMinutes === 0);
+
+console.log('作业路线：作业通道 JSON 解析校验：');
+const good = solver.parseWorkPassage({
+  waypoints: ['a', 'b'],
+  passages: [{ id: 'w1', from: 'a', to: 'b', minutes: 1 }],
+  valveWaypoints: { V1: 'a' },
+});
+check('合法作业通道解析成功', !!good.passage && good.errors.length === 0);
+const eWp = solver.parseWorkPassage({ waypoints: [], passages: [], valveWaypoints: {} });
+check('空路点被拒绝', !eWp.passage && eWp.errors.some((e) => e.includes('waypoints')));
+const eDup = solver.parseWorkPassage({ waypoints: ['a', 'a'], passages: [], valveWaypoints: {} });
+check('重复路点被拒绝', eDup.errors.some((e) => e.includes('重复')));
+const ePsg = solver.parseWorkPassage({
+  waypoints: ['a', 'b'],
+  passages: [{ from: 'a', to: 'b' }],
+  valveWaypoints: {},
+});
+check('缺少 minutes 被拒绝', ePsg.errors.some((e) => e.includes('minutes')));
+const eMin = solver.parseWorkPassage({
+  waypoints: ['a', 'b'],
+  passages: [{ from: 'a', to: 'b', minutes: 0 }],
+  valveWaypoints: {},
+});
+check('minutes 非正整数被拒绝', eMin.errors.some((e) => e.includes('正整数')));
+const eFloat = solver.parseWorkPassage({
+  waypoints: ['a', 'b'],
+  passages: [{ from: 'a', to: 'b', minutes: 2.5 }],
+  valveWaypoints: {},
+});
+check('minutes 小数被拒绝', eFloat.errors.some((e) => e.includes('正整数')));
+const eEnd = solver.parseWorkPassage({
+  waypoints: ['a'],
+  passages: [{ from: 'a', to: 'z', minutes: 1 }],
+  valveWaypoints: {},
+});
+check('通道端点未声明被拒绝', eEnd.errors.some((e) => e.includes('未在 waypoints')));
+const eMap = solver.parseWorkPassage({
+  waypoints: ['a'],
+  passages: [],
+  valveWaypoints: { V1: 'z' },
+});
+check('阀门映射路点未声明被拒绝', eMap.errors.some((e) => e.includes('V1')));
+const eType = solver.parseWorkPassage('nope');
+check('非对象 JSON 被拒绝', !eType.passage && eType.errors.length > 0);
+
+console.log('作业路线：查询校验与纯函数：');
+const rte1 = planRoute(['V1'], '不是路点');
+check('出发路点未声明报错', rte1.status === 'invalid' && rte1.errors.some((e) => e.includes('出发路点')));
+const rte2 = planRoute(['V1'], '  ');
+check('出发路点为空报错', rte2.status === 'invalid');
+const rte3 = planRoute(['VX'], '大门');
+check('待关闭阀门不在拓扑中报错', rte3.status === 'invalid' && rte3.errors.some((e) => e.includes('VX')));
+const beforeRouteNet = JSON.stringify(routeNet);
+const beforeRoutePsg = JSON.stringify(passage);
+const closedInput = ['V2', 'V1'];
+planRoute(closedInput, '大门');
+check('路线测算不修改拓扑', JSON.stringify(routeNet) === beforeRouteNet);
+check('路线测算不修改作业通道输入', JSON.stringify(passage) === beforeRoutePsg);
+check('路线测算不修改待关闭阀门入参数组', closedInput.join(',') === 'V2,V1');
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

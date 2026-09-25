@@ -2094,3 +2094,423 @@ export function planReopenSequence(network: Network, query: CapacityQuery): Reop
     objective: bestValue[fullMask],
   };
 }
+
+// ============ 关阀作业路线 ============
+
+/** 关阀作业路线：必访阀门（所选方案待关闭阀门）数量上限 */
+export const MAX_ROUTE_VALVES = 8;
+
+/** 一条无向作业通道（步行通道），两端为路点，minutes 为步行分钟（正整数）。 */
+export interface WorkPassageEdge {
+  /** 通道编号，选填，仅用于人工对照 */
+  id?: string;
+  from: string;
+  to: string;
+  /** 步行通过该通道所需分钟（正整数）；通道无向，双向耗时相同 */
+  minutes: number;
+}
+
+/**
+ * 作业通道 JSON：路点（与管网拓扑相互独立的步行网络）、无向通道及步行分钟、
+ * 各阀门编号对应的作业路点。
+ */
+export interface WorkPassage {
+  /** 全部路点名称（非空字符串，不可重复） */
+  waypoints: string[];
+  /** 无向步行通道（允许多条并行通道、重复经过） */
+  passages: WorkPassageEdge[];
+  /** 阀门编号 -> 该阀门作业所在路点（只要求被选中方案用到的阀门有映射） */
+  valveWaypoints: Record<string, string>;
+}
+
+/** 路线中一段步行：出发段 / 阀门间转场段 / 返程段。 */
+export type RouteSegmentKind = 'depart' | 'between' | 'return';
+
+export interface RouteSegment {
+  kind: RouteSegmentKind;
+  /** 本段起点路点 */
+  from: string;
+  /** 本段终点路点 */
+  to: string;
+  /** 本段终点处进行关阀操作的阀门编号；返程段为 null */
+  valve: string | null;
+  /** 本段实际通行的完整路点序列（含起终点；允许与其他段重复经过路点 / 通道） */
+  path: string[];
+  /** 本段步行分钟 */
+  minutes: number;
+}
+
+export interface ClosureRouteQuery {
+  /** 管网拓扑（仅用于校验待关闭阀门编号真实存在；测算不修改它） */
+  network: Network;
+  /** 所选关阀方案待关闭的阀门编号（必访点，去重后按编号升序处理） */
+  closedValves: readonly string[];
+  /** 作业通道（步行网络） */
+  passage: WorkPassage;
+  /** 出发路点（路线由此出发并最终返回此点） */
+  start: string;
+}
+
+export interface ClosureRouteOk {
+  status: 'ok';
+  start: string;
+  /** 必访阀门数（所选方案待关闭阀门去重后数量） */
+  requiredValveCount: number;
+  /** 关阀操作顺序（阀门编号序列；总耗时最少，同耗时取字典序最小） */
+  valveOrder: string[];
+  /** 各阀门作业所在路点（阀门编号 -> 路点） */
+  valveWaypoints: Record<string, string>;
+  /** 逐段路线：出发段、阀门间转场段、返程段 */
+  segments: RouteSegment[];
+  /** 总步行分钟（各段耗时之和） */
+  totalMinutes: number;
+}
+
+/** 必访阀门缺少路点映射。 */
+export interface ClosureRouteMissingMap {
+  status: 'missing-map';
+  /** 缺少 valveWaypoints 映射的阀门编号（升序） */
+  missingValves: string[];
+  reason: string;
+}
+
+/** 必访阀门超过上限。 */
+export interface ClosureRouteTooMany {
+  status: 'too-many';
+  requiredValveCount: number;
+  reason: string;
+}
+
+/** 出发路点或某些必访阀门路点之间无路可达。 */
+export interface ClosureRouteUnreachable {
+  status: 'unreachable';
+  /** 互不可达的关键位置对（人类可读位置描述，如「出发路点 X」「阀门 V03 所在路点 Y」） */
+  pairs: { from: string; to: string }[];
+  reason: string;
+}
+
+export interface ClosureRouteInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type ClosureRouteResult =
+  | ClosureRouteOk
+  | ClosureRouteMissingMap
+  | ClosureRouteTooMany
+  | ClosureRouteUnreachable
+  | ClosureRouteInvalid;
+
+/** 解析并校验作业通道 JSON，返回步行网络或错误列表（纯函数，不修改输入）。 */
+export function parseWorkPassage(raw: unknown): { passage?: WorkPassage; errors: string[] } {
+  const errors: string[] = [];
+  if (!isRecord(raw)) {
+    return { errors: ['作业通道 JSON 必须是一个对象，包含 waypoints / passages / valveWaypoints 三个字段。'] };
+  }
+
+  const waypoints = asStringArray(raw.waypoints);
+  if (!waypoints || waypoints.length === 0) {
+    errors.push('waypoints 必须是非空字符串数组（路点名称不可为空、不可重复）。');
+  }
+  const waypointSet = new Set(waypoints ?? []);
+  if (waypoints && waypointSet.size !== waypoints.length) {
+    errors.push('waypoints 中存在重复路点。');
+  }
+
+  const passages: WorkPassageEdge[] = [];
+  if (!Array.isArray(raw.passages)) {
+    errors.push('passages 必须是数组（每项含 from / to / minutes，可带选填 id）。');
+  } else {
+    raw.passages.forEach((p, i) => {
+      if (!isRecord(p) || typeof p.from !== 'string' || !p.from ||
+          typeof p.to !== 'string' || !p.to) {
+        errors.push(`passages[${i}] 必须包含非空字符串字段 from / to。`);
+        return;
+      }
+      if (p.id !== undefined && (typeof p.id !== 'string' || !p.id)) {
+        errors.push(`passages[${i}] 的 id（选填）必须是非空字符串。`);
+      }
+      if (typeof p.minutes !== 'number' || !Number.isSafeInteger(p.minutes) || p.minutes <= 0) {
+        errors.push(`passages[${i}]（${p.from} ↔ ${p.to}）的 minutes 必须是正整数（收到：${String(p.minutes)}）。`);
+      }
+      if (waypointSet.size > 0) {
+        if (!waypointSet.has(p.from)) errors.push(`passages[${i}] 的起点「${p.from}」未在 waypoints 中声明。`);
+        if (!waypointSet.has(p.to)) errors.push(`passages[${i}] 的终点「${p.to}」未在 waypoints 中声明。`);
+      }
+      if (typeof p.minutes === 'number' && Number.isSafeInteger(p.minutes) && p.minutes > 0) {
+        passages.push({ from: p.from, to: p.to, minutes: p.minutes });
+      }
+    });
+  }
+
+  const valveWaypoints: Record<string, string> = {};
+  if (!isRecord(raw.valveWaypoints)) {
+    errors.push('valveWaypoints 必须是对象：键为阀门编号，值为该阀门作业所在路点。');
+  } else {
+    for (const [valve, wp] of Object.entries(raw.valveWaypoints)) {
+      if (!valve) {
+        errors.push('valveWaypoints 中存在空的阀门编号键。');
+        continue;
+      }
+      if (typeof wp !== 'string' || !wp) {
+        errors.push(`阀门「${valve}」对应的路点必须是非空字符串。`);
+        continue;
+      }
+      if (waypointSet.size > 0 && !waypointSet.has(wp)) {
+        errors.push(`阀门「${valve}」对应的路点「${wp}」未在 waypoints 中声明。`);
+        continue;
+      }
+      valveWaypoints[valve] = wp;
+    }
+  }
+
+  if (errors.length > 0 || !waypoints) return { errors };
+  return { passage: { waypoints, passages, valveWaypoints }, errors: [] };
+}
+
+/**
+ * 关阀作业路线：在选定关阀方案的待关闭阀门（必访点，最多 MAX_ROUTE_VALVES 个）上，
+ * 以出发路点为起点、沿无向作业通道步行，访问全部必访阀门并返回出发路点的
+ * 总步行时间最少的完整路线；允许重复经过路点与通道。
+ *
+ * 1. 先用 Floyd–Warshall 求全部路点间最短通行距离（正整数分钟；同名端点间取
+ *    并行通道最小值），并在最短路等耗时的路点序列间取节点序列字典序最小者；
+ * 2. 再用子集动态规划求阀门访问顺序——dp[S][v] 为从出发点出发访问完 S 中阀门
+ *    且最后操作 v 的最少耗时，完整路线再加上 v 返回出发点的最短耗时；
+ *    同耗时按「关阀操作的阀门编号序列」字典序取最小。
+ * 映射缺失、必访阀门超限、关键位置互不可达时分别给出明确状态。
+ * 纯函数测算：不修改拓扑 JSON、阀门登记状态与作业通道输入。
+ */
+export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
+  const { network, passage, start } = query;
+  const errors: string[] = [];
+
+  if (typeof start !== 'string' || !start.trim()) {
+    errors.push('请填写出发路点。');
+  } else if (!passage.waypoints.includes(start.trim())) {
+    errors.push(`出发路点「${start.trim()}」不在作业通道的 waypoints 中。`);
+  }
+  const knownValves = new Set(network.valvedPipes.map((v) => v.id));
+  const badValves = query.closedValves.filter((v) => !knownValves.has(v));
+  for (const v of badValves) errors.push(`待关闭阀门「${v}」不在拓扑的带阀管段编号中。`);
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const startWp = start.trim();
+  // 必访阀门：去重后按编号升序（位编号顺序，与字典序取舍一致）
+  const required = [...new Set(query.closedValves)].sort();
+
+  // 映射缺失
+  const missingValves = required.filter((v) => passage.valveWaypoints[v] === undefined);
+  if (missingValves.length > 0) {
+    return {
+      status: 'missing-map',
+      missingValves,
+      reason:
+        `以下 ${missingValves.length} 个待关闭阀门在 valveWaypoints 中缺少作业路点映射：` +
+        `${missingValves.map((v) => `「${v}」`).join('、')}。请在作业通道 JSON 中补全这些阀门对应的路点后再规划。`,
+    };
+  }
+
+  // 必访阀门数量上限
+  if (required.length > MAX_ROUTE_VALVES) {
+    return {
+      status: 'too-many',
+      requiredValveCount: required.length,
+      reason:
+        `该方案待关闭的阀门有 ${required.length} 个，超过关阀作业路线上限 ${MAX_ROUTE_VALVES} 个；` +
+        '请选择待关闭阀门更少的方案后再规划。',
+    };
+  }
+
+  const m = passage.waypoints.length;
+  const idxOf = new Map<string, number>();
+  passage.waypoints.forEach((wp, i) => idxOf.set(wp, i));
+  // 名称升序的节点次序：等耗时最短路按路点序列字典序取舍
+  const nodesByName = [...passage.waypoints].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+  // 直连矩阵与全源最短路初始化（并行通道取最小分钟；自环不影响正权最短路）
+  const direct: number[][] = Array.from({ length: m }, () => new Array(m).fill(Infinity));
+  const dist: number[][] = Array.from({ length: m }, () => new Array(m).fill(Infinity));
+  for (let i = 0; i < m; i++) {
+    direct[i][i] = 0;
+    dist[i][i] = 0;
+  }
+  for (const e of passage.passages) {
+    const u = idxOf.get(e.from)!;
+    const v = idxOf.get(e.to)!;
+    if (u === v) continue; // 自环对正权最短通行距离无意义
+    if (e.minutes < direct[u][v]) {
+      direct[u][v] = e.minutes;
+      direct[v][u] = e.minutes;
+    }
+    if (e.minutes < dist[u][v]) {
+      dist[u][v] = e.minutes;
+      dist[v][u] = e.minutes;
+    }
+  }
+  // Floyd–Warshall 全源最短路
+  for (let k = 0; k < m; k++) {
+    for (let i = 0; i < m; i++) {
+      if (dist[i][k] === Infinity) continue;
+      for (let j = 0; j < m; j++) {
+        const via = dist[i][k] + dist[k][j];
+        if (via < dist[i][j]) dist[i][j] = via;
+      }
+    }
+  }
+
+  const sIdx = idxOf.get(startWp)!;
+  const valveIdx = required.map((v) => idxOf.get(passage.valveWaypoints[v])!);
+
+  // 关键位置：出发路点与每个必访阀门所在路点；任一互不可达对都明确报出
+  const locations: { label: string; point: number }[] = [
+    { label: `出发路点「${startWp}」`, point: sIdx },
+    ...required.map((v, i) => ({
+      label: `阀门「${v}」所在路点「${passage.valveWaypoints[v]}」`,
+      point: valveIdx[i],
+    })),
+  ];
+  const unreachablePairs: { from: string; to: string }[] = [];
+  for (let i = 0; i < locations.length; i++) {
+    for (let j = i + 1; j < locations.length; j++) {
+      if (dist[locations[i].point][locations[j].point] === Infinity) {
+        unreachablePairs.push({ from: locations[i].label, to: locations[j].label });
+      }
+    }
+  }
+  if (unreachablePairs.length > 0) {
+    return {
+      status: 'unreachable',
+      pairs: unreachablePairs,
+      reason:
+        '作业通道中存在无路可达的关键位置对，无法从出发点依次到达全部必访阀门并返回；' +
+        '请在作业通道 JSON 中补全步行通道后再规划。',
+    };
+  }
+
+  // 等耗时最短路的最小字典序首跳表：
+  // next[u][v] = 名称最小的、位于某条 u→v 最短路上的直连邻居；
+  // 逐级递推即得路点序列字典序最小的最短路（首跳较小者整体序列必更小）。
+  const next: number[][] = Array.from({ length: m }, () => new Array(m).fill(-1));
+  for (let u = 0; u < m; u++) {
+    next[u][u] = u;
+    for (let v = 0; v < m; v++) {
+      if (u === v || dist[u][v] === Infinity) continue;
+      for (const wName of nodesByName) {
+        const w = idxOf.get(wName)!;
+        if (w === u || direct[u][w] === Infinity) continue;
+        if (direct[u][w] + dist[w][v] === dist[u][v]) {
+          next[u][v] = w;
+          break;
+        }
+      }
+    }
+  }
+  const shortestPath = (u: number, v: number): number[] => {
+    if (u === v) return [u];
+    const path = [u];
+    let cur = u;
+    while (cur !== v) {
+      cur = next[cur][v];
+      if (cur === -1) break; // 不会发生：已校验可达
+      path.push(cur);
+    }
+    return path;
+  };
+
+  const n = required.length;
+  const valveWaypointsResult: Record<string, string> = {};
+  required.forEach((v) => {
+    valveWaypointsResult[v] = passage.valveWaypoints[v];
+  });
+
+  // 无需关阀的方案：原地出发并返回，总耗时 0
+  if (n === 0) {
+    return {
+      status: 'ok',
+      start: startWp,
+      requiredValveCount: 0,
+      valveOrder: [],
+      valveWaypoints: {},
+      segments: [],
+      totalMinutes: 0,
+    };
+  }
+
+  // 子集动态规划：bestCost[mask][last] = 从出发点出发、访问完 mask 中阀门、
+  // 最后操作 last 的最少步行分钟；bestSeq 记录同耗时下字典序最小的完整阀门序列。
+  const size = 1 << n;
+  const bestCost: number[][] = Array.from({ length: size }, () => new Array(n).fill(Infinity));
+  const bestSeq: (string[] | null)[][] = Array.from({ length: size }, () => new Array(n).fill(null));
+  for (let i = 0; i < n; i++) {
+    bestCost[1 << i][i] = dist[sIdx][valveIdx[i]];
+    bestSeq[1 << i][i] = [required[i]];
+  }
+  for (let mask = 1; mask < size; mask++) {
+    for (let last = 0; last < n; last++) {
+      if (!(mask & (1 << last)) || (mask & (mask - 1)) === 0) continue; // 单元素集已初始化
+      const prevMask = mask ^ (1 << last);
+      let cost = Infinity;
+      let seq: string[] | null = null;
+      for (let j = 0; j < n; j++) {
+        if (!(prevMask & (1 << j))) continue;
+        const candidateCost = bestCost[prevMask][j] + dist[valveIdx[j]][valveIdx[last]];
+        const candidateSeq = [...bestSeq[prevMask][j]!, required[last]];
+        if (
+          candidateCost < cost ||
+          (candidateCost === cost && (seq === null || compareValveLists(candidateSeq, seq) < 0))
+        ) {
+          cost = candidateCost;
+          seq = candidateSeq;
+        }
+      }
+      bestCost[mask][last] = cost;
+      bestSeq[mask][last] = seq;
+    }
+  }
+
+  // 闭合路线：最后一个阀门操作完返回出发点；返程不操作阀门，同耗时仍按完整序列字典序取舍
+  const fullMask = size - 1;
+  let total = Infinity;
+  let order: string[] = [];
+  for (let last = 0; last < n; last++) {
+    const candidateCost = bestCost[fullMask][last] + dist[valveIdx[last]][sIdx];
+    const candidateSeq = bestSeq[fullMask][last]!;
+    if (candidateCost < total || (candidateCost === total && compareValveLists(candidateSeq, order) < 0)) {
+      total = candidateCost;
+      order = candidateSeq;
+    }
+  }
+
+  // 按最优操作顺序重建逐段实际通道路点（各段内部均为最短步行路径）
+  const pointIdxOfValve = new Map(required.map((v, i) => [v, valveIdx[i]]));
+  const chain: { valve: string | null; point: number }[] = [
+    { valve: null, point: sIdx },
+    ...order.map((v) => ({ valve: v, point: pointIdxOfValve.get(v)! })),
+    { valve: null, point: sIdx },
+  ];
+  const segments: RouteSegment[] = [];
+  for (let i = 1; i < chain.length; i++) {
+    const from = chain[i - 1].point;
+    const to = chain[i].point;
+    const kind: RouteSegmentKind = i === 1 ? 'depart' : i === chain.length - 1 ? 'return' : 'between';
+    segments.push({
+      kind,
+      from: passage.waypoints[from],
+      to: passage.waypoints[to],
+      valve: chain[i].valve,
+      path: shortestPath(from, to).map((p) => passage.waypoints[p]),
+      minutes: dist[from][to],
+    });
+  }
+
+  return {
+    status: 'ok',
+    start: startWp,
+    requiredValveCount: n,
+    valveOrder: order,
+    valveWaypoints: valveWaypointsResult,
+    segments,
+    totalMinutes: total,
+  };
+}

@@ -76,3 +76,53 @@ export const SAMPLE_OBSERVER_CANDIDATES: string[] = [
   '卫生间',
   '设备间',
 ];
+
+/**
+ * 示例关阀作业路线：展馆步行检修通道（与供水管网拓扑相互独立的无向步行网络）。
+ * 推荐关阀方案为 [V03, V04]：从「检修大门」出发，依次到 V03、V04 作业后返回；
+ * 两种操作顺序总耗时相同（各 24 分钟），同耗时按阀门编号字典序取 V03 → V04。
+ */
+export const SAMPLE_WORK_PASSAGE = {
+  waypoints: [
+    '检修大门',
+    '路口甲',
+    '路口乙',
+    '环管N1井位',
+    '环管N2井位',
+    '环管N3井位',
+    '环管N4井位',
+    'S1泵房',
+    'S2水箱间',
+    '展厅B检修口',
+    '卫生间检修口',
+  ],
+  passages: [
+    { id: 'W01', from: '检修大门', to: '路口甲', minutes: 3 },
+    { id: 'W02', from: '检修大门', to: '路口乙', minutes: 8 },
+    { id: 'W03', from: '路口甲', to: '环管N1井位', minutes: 4 },
+    { id: 'W04', from: '环管N1井位', to: '展厅B检修口', minutes: 2 },
+    { id: 'W05', from: '环管N1井位', to: 'S1泵房', minutes: 2 },
+    { id: 'W06', from: '环管N1井位', to: '环管N2井位', minutes: 5 },
+    { id: 'W07', from: '环管N2井位', to: '环管N3井位', minutes: 5 },
+    { id: 'W08', from: '环管N3井位', to: '环管N4井位', minutes: 5 },
+    { id: 'W09', from: '环管N4井位', to: '环管N1井位', minutes: 6 },
+    { id: 'W10', from: '环管N3井位', to: '卫生间检修口', minutes: 2 },
+    { id: 'W11', from: '环管N4井位', to: 'S2水箱间', minutes: 2 },
+    { id: 'W12', from: '环管N4井位', to: '展厅B检修口', minutes: 3 },
+    { id: 'W13', from: '路口乙', to: '环管N3井位', minutes: 4 },
+  ],
+  valveWaypoints: {
+    V01: 'S1泵房',
+    V02: 'S2水箱间',
+    V03: '环管N1井位',
+    V04: '环管N2井位',
+    V05: '环管N3井位',
+    V06: '环管N4井位',
+    V07: '卫生间检修口',
+    V08: '展厅B检修口',
+    V09: '展厅B检修口',
+  },
+};
+
+/** 示例关阀作业路线：出发路点。 */
+export const SAMPLE_ROUTE_START = '检修大门';

@@ -10,6 +10,8 @@ import {
   planSingleValveObservers,
   scanValveClosureRisk,
   planReopenSequence,
+  parseWorkPassage,
+  planClosureRoute,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
@@ -17,10 +19,12 @@ import {
   MAX_FLIPS,
   MAX_OBSERVER_CANDIDATES,
   MAX_REOPEN_VALVES,
+  MAX_ROUTE_VALVES,
   type Query,
   type CapacityQuery,
   type AnomalyQuery,
   type ObserverQuery,
+  type ClosureRouteResult,
   type SolveResult,
   type ResilienceResult,
   type CapacityResult,
@@ -43,6 +47,8 @@ import {
   SAMPLE_WET_NODES,
   SAMPLE_DRY_NODES,
   SAMPLE_OBSERVER_CANDIDATES,
+  SAMPLE_WORK_PASSAGE,
+  SAMPLE_ROUTE_START,
 } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -62,7 +68,10 @@ app.innerHTML = `
       并能做「单阀异常观测点规划」（把登记状态与每个阀门单独翻转作为假设，按候选观测节点的有水 / 无水签名归并不可区分组，
       并搜索能区分任意两组的最少观测点集合，最多填 ${MAX_OBSERVER_CANDIDATES} 个候选节点），
       还能做「复水开阀顺序规划」（以当前登记为关闭的阀门为待开清单，最多 ${MAX_REOPEN_VALVES} 个，
-      每步仅开启一个待开阀门，规划使各步开阀后总获配量之和最大的完整开阀顺序）。
+      每步仅开启一个待开阀门，规划使各步开阀后总获配量之和最大的完整开阀顺序），
+      并能在选定关阀方案后做「关阀作业路线」（另填路点 / 无向通道 / 步行分钟 / 阀门路点的作业通道 JSON 与出发路点，
+      先求路点间最短通行距离，再用子集动态规划求出发并返回、总步行时间最少的完整关阀路线，
+      同分按阀门编号序列字典序取舍，必访阀门最多 ${MAX_ROUTE_VALVES} 个）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -173,11 +182,43 @@ app.innerHTML = `
       <div class="button-row">
         <button id="plan-observers" type="button" class="secondary">规划观测点</button>
       </div>
+      <h2>6. 关阀作业路线</h2>
+      <p class="hint">
+        先在右上「关阀方案搜索结果」中<strong>选择一个方案</strong>（默认推荐方案），以该方案待关闭阀门为必访点
+        （最多 ${MAX_ROUTE_VALVES} 个），另填<strong>作业通道 JSON</strong>（路点、无向通道及正整数步行分钟、各阀门对应路点）
+        与<strong>出发路点</strong>，规划从出发点出发、依次关闭全部必访阀门并返回的总步行时间最少完整路线
+        （允许重复经过路点与通道；同耗时按关阀操作的阀门编号序列字典序取舍）。测算不修改拓扑与阀门登记状态。
+      </p>
+      <label>
+        作业通道 JSON（waypoints / passages / valveWaypoints）
+        <textarea id="work-passage" class="sub-textarea" spellcheck="false"
+          placeholder='{"waypoints":["大门",...,"passages":[{"from":"大门","to":"路口","minutes":5}],"valveWaypoints":{"V03":"N2井位"}}'></textarea>
+      </label>
+      <div class="fields">
+        <label>
+          出发路点（须包含在 waypoints 中，路线由此出发并返回）
+          <input id="route-start" type="text" placeholder="如：检修大门" />
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="plan-closure-route" type="button" class="secondary">规划关阀作业路线</button>
+      </div>
+      <p class="hint" id="selected-solution-hint">尚未选择方案：请先点击「搜索关阀方案」，再在结果中选择一个方案（默认选择推荐方案）。</p>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
         <h2>关阀方案搜索结果</h2>
         <div id="result"><p class="hint">尚未求解。可点击「载入示例拓扑」快速体验。</p></div>
+      </section>
+      <section class="panel result-panel">
+        <h2>关阀作业路线</h2>
+        <div id="closure-route-result">
+          <p class="hint">
+            选择一个关阀方案、填好作业通道 JSON 与出发路点后点击「规划关阀作业路线」，
+            这里展示阀门操作顺序、逐段实际通道路点、分段与总耗时；无路可达、映射缺失或必访阀门超过
+            ${MAX_ROUTE_VALVES} 个时会给出明确提示。
+          </p>
+        </div>
       </section>
       <section class="panel result-panel">
         <h2>保供韧性巡检</h2>
@@ -273,8 +314,12 @@ const outletsEl = el<HTMLInputElement>('#outlets');
 const wetNodesEl = el<HTMLInputElement>('#wet-nodes');
 const dryNodesEl = el<HTMLInputElement>('#dry-nodes');
 const observerCandidatesEl = el<HTMLInputElement>('#observer-candidates');
+const workPassageEl = el<HTMLTextAreaElement>('#work-passage');
+const routeStartEl = el<HTMLInputElement>('#route-start');
+const selectedSolutionHintEl = el<HTMLParagraphElement>('#selected-solution-hint');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
+const closureRouteResultEl = el<HTMLDivElement>('#closure-route-result');
 const capacityFormEl = el<HTMLDivElement>('#capacity-form');
 const capacityResultEl = el<HTMLDivElement>('#capacity-result');
 const priorityResultEl = el<HTMLDivElement>('#priority-result');
@@ -290,6 +335,37 @@ interface CapacityFormState {
   outlets: string[];
 }
 let capacityFormState: CapacityFormState | null = null;
+
+/** 当前在关阀方案结果中选中的方案（待关闭阀门编号）；null 表示尚未选择有效方案。 */
+let selectedClosedValves: string[] | null = null;
+/** 最近一次关阀方案搜索结果，供「选择该方案」按钮读取。 */
+let lastSolveResult: SolveResult | null = null;
+
+/** 刷新「已选方案」提示。 */
+function renderSelectedSolutionHint(): void {
+  if (selectedClosedValves === null) {
+    selectedSolutionHintEl.textContent =
+      '尚未选择方案：请先点击「搜索关阀方案」，再在结果中选择一个方案（默认选择推荐方案）。';
+    selectedSolutionHintEl.className = 'hint';
+    return;
+  }
+  selectedSolutionHintEl.innerHTML =
+    `已选方案（必访阀门 ${selectedClosedValves.length} 个）：` +
+    (selectedClosedValves.length > 0
+      ? selectedClosedValves.map((v) => `<code>${escapeHtml(v)}</code>`).join('、')
+      : '无需关阀');
+  selectedSolutionHintEl.className = 'hint selected-hint';
+}
+
+/** 在关阀方案结果中选择某个方案作为作业路线的必访点（由结果区按钮事件委托调用）。 */
+function selectSolution(index: number): void {
+  const current = lastSolveResult;
+  if (!current || current.status !== 'ok') return;
+  const sol = current.solutions[index];
+  if (!sol) return;
+  selectedClosedValves = [...sol.closed];
+  renderSelectedSolutionHint();
+}
 
 function splitList(text: string): string[] {
   return text
@@ -317,17 +393,35 @@ function renderErrors(target: HTMLElement, title: string, errors: string[]): voi
 }
 
 function renderResult(result: SolveResult, query: Query): void {
+  lastSolveResult = result;
   if (result.status === 'invalid') {
+    selectedClosedValves = null;
+    renderSelectedSolutionHint();
     renderErrors(resultEl, '输入有误，无法求解：', result.errors);
     return;
   }
   if (result.status === 'no-solution') {
+    selectedClosedValves = null;
+    renderSelectedSolutionHint();
     resultEl.innerHTML = `
       <div class="banner error">无解：当前条件下不存在满足要求的关阀组合。</div>
       <p>${escapeHtml(result.reason)}</p>
       <p class="hint">参与搜索的开启阀门数：${result.openValveCount}</p>`;
     return;
   }
+
+  // 默认选择推荐方案（首个、字典序最小）；重新求解后若原选方案仍在则保留
+  if (
+    selectedClosedValves === null ||
+    !result.solutions.some(
+      (s) =>
+        s.closed.length === selectedClosedValves!.length &&
+        s.closed.every((v, i) => v === selectedClosedValves![i])
+    )
+  ) {
+    selectedClosedValves = [...result.solutions[0].closed];
+  }
+  renderSelectedSolutionHint();
 
   const best = result.solutions[0];
   const rows = (sol: typeof best) =>
@@ -354,21 +448,33 @@ function renderResult(result: SolveResult, query: Query): void {
       漏点「${escapeHtml(query.leak)}」在所有方案中均已与全部供水点断开；
       输入 JSON 中的阀门开闭状态不会被修改。
     </p>
+    <p class="hint">在下方选择一个方案用于「关阀作业路线」（必访阀门即该方案待关闭阀门，默认已选推荐方案）。</p>
     ${result.solutions
       .map(
-        (sol, i) => `
+        (sol, i) => {
+          const isSelected =
+            selectedClosedValves !== null &&
+            sol.closed.length === selectedClosedValves.length &&
+            sol.closed.every((v, j) => v === selectedClosedValves![j]);
+          return `
       <details class="solution" ${i === 0 ? 'open' : ''}>
         <summary>
           方案 ${i + 1}：关闭 ${sol.closed.length} 个阀门
           ${sol.closed.length > 0 ? `（${sol.closed.map(escapeHtml).join('、')}）` : ''}
         </summary>
+        <div class="solution-actions">
+          <button type="button" class="select-solution-btn${isSelected ? ' selected' : ''}" data-solution-index="${i}">
+            ${isSelected ? '✓ 已选为作业路线方案' : '选择该方案用于作业路线'}
+          </button>
+        </div>
         <table>
           <thead>
             <tr><th>保供出口</th><th>连通状态</th><th>可达供水点</th></tr>
           </thead>
           <tbody>${rows(sol)}</tbody>
         </table>
-      </details>`
+      </details>`;
+        }
       )
       .join('')}
     ${result.truncated ? '<p class="hint">最优方案过多，仅展示前 100 个。</p>' : ''}`;
@@ -1109,6 +1215,118 @@ function renderObserverPlan(result: ObserverPlanResult): void {
     </details>`;
 }
 
+const ROUTE_SEGMENT_LABEL: Record<import('./solver').RouteSegmentKind, string> = {
+  depart: '出发',
+  between: '转场',
+  return: '返程',
+};
+
+function renderClosureRoute(result: ClosureRouteResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(closureRouteResultEl, '输入有误，无法规划关阀作业路线：', result.errors);
+    return;
+  }
+  if (result.status === 'missing-map') {
+    closureRouteResultEl.innerHTML = `
+      <div class="banner error">映射缺失：存在未提供作业路点的必访阀门。</div>
+      <p>${escapeHtml(result.reason)}</p>
+      <p class="hint">缺失映射的阀门：${result.missingValves
+        .map((v) => `<code>${escapeHtml(v)}</code>`)
+        .join('、')}（共 ${result.missingValves.length} 个）。</p>`;
+    return;
+  }
+  if (result.status === 'too-many') {
+    closureRouteResultEl.innerHTML = `
+      <div class="banner error">必访阀门超过上限，无法规划。</div>
+      <p>${escapeHtml(result.reason)}</p>`;
+    return;
+  }
+  if (result.status === 'unreachable') {
+    closureRouteResultEl.innerHTML = `
+      <div class="banner error">无路可达：无法完成「出发 → 全部必访阀门 → 返回」的完整路线。</div>
+      <p>${escapeHtml(result.reason)}</p>
+      <table>
+        <thead>
+          <tr><th>位置 A</th><th>位置 B</th></tr>
+        </thead>
+        <tbody>
+          ${result.pairs
+            .map(
+              (p) => `
+            <tr>
+              <td>${escapeHtml(p.from)}</td>
+              <td>${escapeHtml(p.to)}</td>
+            </tr>`
+            )
+            .join('')}
+        </tbody>
+      </table>
+      <p class="hint">请在作业通道 JSON 的 passages 中补全步行通道（minutes 为正整数）后再规划。</p>`;
+    return;
+  }
+
+  if (result.requiredValveCount === 0) {
+    closureRouteResultEl.innerHTML = `
+      <div class="banner success">
+        所选方案无需关闭任何阀门：不必安排关阀作业，从出发路点
+        <code>${escapeHtml(result.start)}</code> 原地返回，总步行 <strong>0</strong> 分钟。
+      </div>`;
+    return;
+  }
+
+  const segmentRows = result.segments
+    .map((seg) => {
+      const tagClass = seg.kind === 'depart' ? 'tag-supply' : seg.kind === 'return' ? 'tag-normal' : 'tag-pipe';
+      const action =
+        seg.valve !== null
+          ? `关闭 <code>${escapeHtml(seg.valve)}</code>（<span class="hint">${escapeHtml(result.valveWaypoints[seg.valve])}</span>）`
+          : '<span class="hint">返回出发点</span>';
+      return `
+      <tr>
+        <td><span class="tag ${tagClass}">${ROUTE_SEGMENT_LABEL[seg.kind]}</span></td>
+        <td>${escapeHtml(seg.from)} → ${escapeHtml(seg.to)}</td>
+        <td>${action}</td>
+        <td>${seg.path.map((p) => escapeHtml(p)).join(' → ')}</td>
+        <td class="num"><strong>${seg.minutes}</strong></td>
+      </tr>`;
+    })
+    .join('');
+
+  closureRouteResultEl.innerHTML = `
+    <div class="banner success">
+      已选方案的 ${result.requiredValveCount} 个必访阀门全部可达；最优完整路线总步行
+      <strong>${result.totalMinutes}</strong> 分钟（从 <code>${escapeHtml(result.start)}</code> 出发并返回）。
+      同耗时按关阀操作的阀门编号序列字典序取最小。
+    </div>
+    <h3>阀门操作顺序</h3>
+    <p>
+      ${result.valveOrder
+        .map(
+          (v, i) =>
+            `<span class="op-step"><span class="op-no">${i + 1}</span> 关闭 <code>${escapeHtml(v)}</code>
+             <span class="hint">（${escapeHtml(result.valveWaypoints[v])}）</span></span>`
+        )
+        .join('　')}
+    </p>
+    <h3>逐段实际通道路点与分段耗时</h3>
+    <table>
+      <thead>
+        <tr><th>段落</th><th>起 → 止</th><th>本段操作</th><th>实际通行路点</th><th>步行分钟</th></tr>
+      </thead>
+      <tbody>${segmentRows}</tbody>
+      <tfoot>
+        <tr>
+          <td colspan="4" class="num"><strong>总耗时</strong></td>
+          <td class="num"><strong>${result.totalMinutes}</strong></td>
+        </tr>
+      </tfoot>
+    </table>
+    <p class="hint">
+      各段内部均取路点间最短通行距离（Floyd–Warshall），阀门访问顺序由子集动态规划求得，
+      允许重复经过路点与通道；路线测算<strong>不修改拓扑 JSON、阀门登记状态与作业通道输入</strong>。
+    </p>`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -1304,6 +1522,40 @@ function runObserverPlan(): void {
   }
 }
 
+function runClosureRoute(): void {
+  try {
+    const network = readNetwork();
+    if (selectedClosedValves === null) {
+      renderErrors(closureRouteResultEl, '尚未选择关阀方案：', [
+        '请先点击「搜索关阀方案」，再在「关阀方案搜索结果」中选择一个方案（默认已选推荐方案），然后再规划作业路线。',
+      ]);
+      return;
+    }
+    let rawPassage: unknown;
+    try {
+      rawPassage = JSON.parse(workPassageEl.value);
+    } catch (e) {
+      renderErrors(closureRouteResultEl, '作业通道 JSON 解析失败：', [(e as Error).message]);
+      return;
+    }
+    const { passage, errors: passageErrors } = parseWorkPassage(rawPassage);
+    if (!passage) {
+      renderErrors(closureRouteResultEl, '作业通道 JSON 校验失败：', passageErrors);
+      return;
+    }
+    renderClosureRoute(
+      planClosureRoute({
+        network,
+        closedValves: selectedClosedValves,
+        passage,
+        start: routeStartEl.value.trim(),
+      })
+    );
+  } catch (e) {
+    renderErrors(closureRouteResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
@@ -1312,6 +1564,8 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   wetNodesEl.value = SAMPLE_WET_NODES.join(', ');
   dryNodesEl.value = SAMPLE_DRY_NODES.join(', ');
   observerCandidatesEl.value = SAMPLE_OBSERVER_CANDIDATES.join(', ');
+  workPassageEl.value = JSON.stringify(SAMPLE_WORK_PASSAGE, null, 2);
+  routeStartEl.value = SAMPLE_ROUTE_START;
   buildCapacityForm(
     SAMPLE_QUERY.supplies,
     SAMPLE_QUERY.outlets,
@@ -1327,6 +1581,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runValveRisk();
   runAnomaly();
   runObserverPlan();
+  runClosureRoute();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
@@ -1338,6 +1593,21 @@ el<HTMLButtonElement>('#scan-valve-risk').addEventListener('click', runValveRisk
 el<HTMLButtonElement>('#plan-reopen').addEventListener('click', runReopenPlan);
 el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
 el<HTMLButtonElement>('#plan-observers').addEventListener('click', runObserverPlan);
+el<HTMLButtonElement>('#plan-closure-route').addEventListener('click', runClosureRoute);
+// 关阀方案结果区「选择该方案用于作业路线」按钮（事件委托）
+resultEl.addEventListener('click', (ev) => {
+  const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('.select-solution-btn');
+  if (!btn) return;
+  const index = Number(btn.dataset.solutionIndex);
+  if (!Number.isInteger(index)) return;
+  selectSolution(index);
+  // 就地刷新各方案按钮的选中态，保留各方案的展开 / 折叠状态
+  resultEl.querySelectorAll<HTMLButtonElement>('.select-solution-btn').forEach((b) => {
+    const selected = b === btn;
+    b.classList.toggle('selected', selected);
+    b.textContent = selected ? '✓ 已选为作业路线方案' : '选择该方案用于作业路线';
+  });
+});
 el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
   try {
     readNetwork(); // 仅校验拓扑 JSON，核验不依赖漏点
