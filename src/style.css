@@ -128,6 +128,30 @@ input[type='text'] {
   color: var(--text);
 }
 
+select {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.95rem;
+  background: #fff;
+  color: var(--text);
+}
+
+select:disabled {
+  background: #f2f4f7;
+  color: var(--muted);
+}
+
+textarea.route-textarea {
+  min-height: 180px;
+  margin-top: 4px;
+}
+
+tfoot td {
+  border-top: 2px solid var(--border);
+  border-bottom: none;
+}
+
 button {
   cursor: pointer;
   border: 1px solid var(--border);
